@@ -1,0 +1,6 @@
+pytest
+
+# Optional official metric bridge dependencies.
+# Install in a Kaggle/isolated environment if heavy transitive dependencies are acceptable:
+# tracksdata
+# tracking-cellmot @ git+https://github.com/royerlab/kaggle-cell-tracking-competition.git

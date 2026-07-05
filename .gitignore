@@ -1,0 +1,14 @@
+.pytest_cache/
+.pytest_deps/
+.official_deps/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+data/
+models/
+predictions/
+results/
+*.zarr
+*.geff
+*.pt
+*.pth
