@@ -185,8 +185,50 @@ $env:PYTHONPATH = (Resolve-Path -LiteralPath '.pytest_deps').Path
 Latest local result:
 
 ```text
-42 passed, 2 skipped, 4 warnings in 2.00s
+47 passed, 2 skipped, 4 warnings in 1.45s
 ```
+
+## Phase 1.0 Oracle Framework
+
+Added:
+
+- `src/oracle/oracle_experiments.py`
+- `tests/oracle/test_oracle_perturbations.py`
+- `ORACLE_FINDINGS.md`
+
+The oracle framework perturbs canonical official submission DataFrames and rebuilds graphs through the submission bridge. This keeps dataset-scoped identity and official sentinel values intact.
+
+Implemented experiments:
+
+- `node_dropout`
+- `coord_jitter`
+- `node_count_adjustment_curve`
+- `division_removal`
+- `edge_swap`
+
+CLI:
+
+```bash
+python -m src.oracle.oracle_experiments \
+  --train-root /kaggle/input/competitions/biohub-cell-tracking-during-development/train \
+  --limit 5 \
+  --seed 42 \
+  --output-dir /kaggle/working/oracle
+```
+
+Optional:
+
+```bash
+--prefer-divisions --limit 20
+```
+
+Local status:
+
+```text
+train root does not exist: \kaggle\input\competitions\biohub-cell-tracking-during-development\train
+```
+
+So official integration skipped locally and no oracle CSVs were created here. In Kaggle, the framework uses `open_dataset(..., normalize=False, require_tracks=True, load_image=False)` and official `tracking_cellmot` metrics when available. Local tests are non-official dependency-light checks only.
 
 ## Remaining Open Questions
 
