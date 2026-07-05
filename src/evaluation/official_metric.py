@@ -9,6 +9,7 @@ import logging
 import math
 from pathlib import Path
 from typing import Mapping, Sequence
+import warnings
 
 from .geff import extract_divisions
 from .matching import match_nodes
@@ -18,9 +19,10 @@ LOGGER = logging.getLogger(__name__)
 
 
 try:  # pragma: no cover - optional official package.
-    from tracking_cellmot.metrics import evaluate, per_sample_metrics, summarise  # type: ignore[import-not-found]
+    from tracking_cellmot.metrics import evaluate, node_recall, per_sample_metrics, summarise  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - expected locally.
     evaluate = None
+    node_recall = None
     per_sample_metrics = None
     summarise = None
 
@@ -38,6 +40,7 @@ class OfficialStyleMetricResult:
     division_false_negative: int
     division_jaccard: float
     final_score: float
+    total_node_ratio: float
     t_pred: int
     t_true: float | None
     edge_weight: int
@@ -60,6 +63,14 @@ def adjusted_edge_jaccard(edge_jaccard: float, t_pred: int, t_true: float | None
     if t_true is None or not math.isfinite(t_true) or t_true <= 0:
         return math.nan
     return max(0.0, edge_jaccard * (1.0 - 0.1 * (t_pred - t_true) / t_true))
+
+
+def total_node_ratio(t_pred: int, t_true: float | None) -> float:
+    """Return official ``(T_pred - T_true) / T_true`` or NaN when unavailable."""
+
+    if t_true is None or not math.isfinite(t_true) or t_true <= 0:
+        return math.nan
+    return (t_pred - t_true) / t_true
 
 
 def _edge_counts_official_fallback(pred_graph: SequenceGraph, gt_graph: SequenceGraph, scale) -> tuple[int, int, int]:
@@ -143,6 +154,7 @@ def evaluate_one_dataset(
     edge_tp, edge_fp, edge_fn = _edge_counts_official_fallback(pred_graph, gt_graph, scale)
     edge_j = _jaccard(edge_tp, edge_fp, edge_fn)
     adjusted = adjusted_edge_jaccard(edge_j, len(pred_graph.nodes), t_true)
+    ratio = total_node_ratio(len(pred_graph.nodes), t_true)
     div_tp, div_fp, div_fn = _division_counts_fallback(pred_graph, gt_graph, scale)
     div_j = _jaccard(div_tp, div_fp, div_fn)
     final = math.nan if math.isnan(adjusted) else adjusted + (0.1 * div_j if div_tp + div_fp + div_fn > 0 else 0.0)
@@ -160,6 +172,7 @@ def evaluate_one_dataset(
         division_false_negative=div_fn,
         division_jaccard=div_j,
         final_score=final,
+        total_node_ratio=ratio,
         t_pred=len(pred_graph.nodes),
         t_true=t_true,
         edge_weight=edge_tp + edge_fp + edge_fn,
@@ -207,27 +220,45 @@ def evaluate_datasets_official_style(
     )
 
 
+def _attrs_from_metadata_file(metadata_path: Path) -> dict:
+    try:
+        data = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if metadata_path.name == "zarr.json" and isinstance(data.get("attributes"), dict):
+        return data["attributes"]
+    return data if isinstance(data, dict) else {}
+
+
 def read_estimated_number_of_nodes(geff_path: str | Path) -> float | None:
-    """Read GEFF metadata ``extra.estimated_number_of_nodes`` when available."""
+    """Read official GEFF ``geff.extra.estimated_number_of_nodes`` metadata.
+
+    Supports Zarr v3 ``zarr.json`` attribute storage and Zarr v2 ``.zattrs``.
+    The legacy ``extra.estimated_number_of_nodes`` location is retained as a
+    deprecated fallback.
+    """
 
     path = Path(geff_path)
     metadata_paths = [path / "zarr.json", path / ".zattrs"]
     for metadata_path in metadata_paths:
         if not metadata_path.exists():
             continue
-        try:
-            data = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        candidates = [
-            data.get("estimated_number_of_nodes"),
-            data.get("extra", {}).get("estimated_number_of_nodes") if isinstance(data.get("extra"), dict) else None,
-            data.get("attributes", {}).get("estimated_number_of_nodes") if isinstance(data.get("attributes"), dict) else None,
-            data.get("attributes", {}).get("extra", {}).get("estimated_number_of_nodes")
-            if isinstance(data.get("attributes"), dict) and isinstance(data.get("attributes", {}).get("extra"), dict)
-            else None,
-        ]
-        for value in candidates:
-            if value is not None:
-                return float(value)
+        attrs = _attrs_from_metadata_file(metadata_path)
+        geff_attrs = attrs.get("geff")
+        if isinstance(geff_attrs, dict):
+            extra = geff_attrs.get("extra")
+            if isinstance(extra, dict) and extra.get("estimated_number_of_nodes") is not None:
+                return float(extra["estimated_number_of_nodes"])
+        legacy_extra = attrs.get("extra")
+        if isinstance(legacy_extra, dict) and legacy_extra.get("estimated_number_of_nodes") is not None:
+            warnings.warn(
+                "GEFF metadata at attrs['extra']['estimated_number_of_nodes'] is deprecated; "
+                "expected attrs['geff']['extra']['estimated_number_of_nodes']",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return float(legacy_extra["estimated_number_of_nodes"])
+    message = f"estimated_number_of_nodes not found in GEFF metadata: {path}"
+    LOGGER.warning("%s", message)
+    warnings.warn(message, RuntimeWarning, stacklevel=2)
     return None

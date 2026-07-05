@@ -1,6 +1,17 @@
 pytest
 
 # Optional official metric bridge dependencies.
-# Install in a Kaggle/isolated environment if heavy transitive dependencies are acceptable:
+# Verified in Kaggle by installing into an isolated target directory with numpy<2.5
+# to avoid numba failures from NumPy 2.5:
+#
+# python -m pip install --target /kaggle/working/official_deps "numpy<2.5" geff tracksdata
+# python -m pip install --target /kaggle/working/official_deps --no-deps \
+#   git+https://github.com/royerlab/kaggle-cell-tracking-competition.git
+#
+# Direct unpinned installs may pull NumPy 2.5, which is incompatible with numba
+# in the verified Kaggle runtime. Working versions observed:
+# numpy 2.4.6
+# numba 0.66.0
+#
 # tracksdata
 # tracking-cellmot @ git+https://github.com/royerlab/kaggle-cell-tracking-competition.git

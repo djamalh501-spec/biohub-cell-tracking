@@ -15,6 +15,7 @@ from src.evaluation.geff import extract_divisions, list_geff_arrays, read_geff_g
 
 
 TRAIN_ROOT = Path("/kaggle/input/competitions/biohub-cell-tracking-during-development/train")
+TEST_ROOT = Path("/kaggle/input/competitions/biohub-cell-tracking-during-development/test")
 OUTPUT_PATH = Path("GEFF_GRAPH_AUDIT.md")
 
 
@@ -42,6 +43,37 @@ def _sample_array(path: Path, array_path: str, limit: int = 10) -> str:
 def main() -> int:
     lines: list[str] = ["# GEFF Graph Audit", ""]
     lines.append(f"Train root: `{TRAIN_ROOT}`")
+    lines.append(f"Test root: `{TEST_ROOT}`")
+    lines.append("")
+    lines.extend(["## Test Set", ""])
+    if TEST_ROOT.exists():
+        test_rows: list[list[str]] = []
+        for zarr_path in sorted(TEST_ROOT.glob("*.zarr")):
+            shape = "unknown"
+            try:
+                import zarr  # type: ignore[import-not-found]
+
+                group = zarr.open_group(zarr_path, mode="r")
+                shape = str(tuple(group["0"].shape))
+            except (ImportError, KeyError, OSError, ValueError, TypeError):
+                pass
+            test_rows.append([zarr_path.stem, shape, str((TEST_ROOT / f"{zarr_path.stem}.geff").exists())])
+        lines.extend(_markdown_table(["dataset", "image_shape", "has_geff"], test_rows))
+    else:
+        lines.append("Test root does not exist in this environment.")
+        lines.append("")
+        lines.append("Known official test stems from the runtime audit/sample submission:")
+        lines.append("")
+        lines.extend(
+            [
+                "- `44b6_0113de3b`",
+                "- `44b6_0b24845f`",
+                "- `6bba_05b6850b`",
+                "- `6bba_05db0fb1`",
+            ]
+        )
+    lines.append("")
+    lines.append("The test set has no `.geff` annotations; `T_true` is unavailable at inference and lives in the hidden scorer.")
     lines.append("")
     if not TRAIN_ROOT.exists():
         lines.append("Train root does not exist in this environment.")

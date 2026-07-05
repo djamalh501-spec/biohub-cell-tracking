@@ -101,11 +101,43 @@ def test_read_estimated_number_of_nodes_from_geff_metadata(tmp_path) -> None:
     geff = tmp_path / "demo.geff"
     geff.mkdir()
     (geff / "zarr.json").write_text(
-        '{"attributes": {"extra": {"estimated_number_of_nodes": 123.5}}}',
+        '{"attributes": {"geff": {"extra": {"estimated_number_of_nodes": 123.5}}}}',
         encoding="utf-8",
     )
 
     assert read_estimated_number_of_nodes(geff) == 123.5
+
+
+def test_read_estimated_number_of_nodes_from_zarr_v2_attrs(tmp_path) -> None:
+    geff = tmp_path / "demo_v2.geff"
+    geff.mkdir()
+    (geff / ".zattrs").write_text(
+        '{"geff": {"extra": {"estimated_number_of_nodes": 456}}}',
+        encoding="utf-8",
+    )
+
+    assert read_estimated_number_of_nodes(geff) == 456.0
+
+
+def test_read_estimated_number_of_nodes_legacy_extra_warns(tmp_path) -> None:
+    geff = tmp_path / "legacy.geff"
+    geff.mkdir()
+    (geff / ".zattrs").write_text(
+        '{"extra": {"estimated_number_of_nodes": 789}}',
+        encoding="utf-8",
+    )
+
+    with pytest.warns(DeprecationWarning, match="deprecated"):
+        assert read_estimated_number_of_nodes(geff) == 789.0
+
+
+def test_read_estimated_number_of_nodes_missing_warns(tmp_path) -> None:
+    geff = tmp_path / "missing.geff"
+    geff.mkdir()
+    (geff / "zarr.json").write_text('{"attributes": {"geff": {"extra": {}}}}', encoding="utf-8")
+
+    with pytest.warns(RuntimeWarning, match="estimated_number_of_nodes not found"):
+        assert read_estimated_number_of_nodes(geff) is None
 
 
 def test_tracking_cellmot_cross_check_skips_when_unavailable() -> None:
