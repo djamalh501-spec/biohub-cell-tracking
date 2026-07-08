@@ -46,6 +46,30 @@ def _validate_official_submission_df(df: pd.DataFrame) -> None:
         raise ValueError("official submission row validation failed: " + "; ".join(row_errors))
 
 
+def _safe_add_node_attr_key(graph: Any, key: str, dtype: Any, *, default_value: Any) -> None:
+    try:
+        graph.add_node_attr_key(key, dtype, default_value=default_value)
+    except ValueError as exc:
+        if "already exists" not in str(exc).lower():
+            raise
+
+
+def _safe_add_edge_attr_key(graph: Any, key: str, dtype: Any, *, default_value: Any) -> None:
+    try:
+        graph.add_edge_attr_key(key, dtype, default_value=default_value)
+    except ValueError as exc:
+        if "already exists" not in str(exc).lower():
+            raise
+
+
+def _new_tracksdata_graph() -> Any:
+    graph_module = _tracksdata.graph
+    graph_cls = getattr(graph_module, "IndexedRXGraph", None)
+    if graph_cls is None:
+        graph_cls = graph_module.InMemoryGraph
+    return graph_cls()
+
+
 def _build_official_tracksdata_graphs(df: pd.DataFrame):
     if _tracksdata is None:
         return None
@@ -56,10 +80,10 @@ def _build_official_tracksdata_graphs(df: pd.DataFrame):
 
     graphs = {}
     for dataset, dataset_df in df.groupby("dataset", sort=True):
-        graph = _tracksdata.graph.InMemoryGraph()
-        graph.add_node_attr_key("t", pl.Int64, default_value=0)
+        graph = _new_tracksdata_graph()
+        _safe_add_node_attr_key(graph, "t", pl.Int64, default_value=0)
         for key in ("z", "y", "x"):
-            graph.add_node_attr_key(key, pl.Float64, default_value=0.0)
+            _safe_add_node_attr_key(graph, key, pl.Float64, default_value=0.0)
         node_rows = dataset_df[dataset_df["row_type"] == "node"].sort_values(["t", "node_id"])
         nodes = [
             {

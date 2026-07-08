@@ -185,7 +185,7 @@ $env:PYTHONPATH = (Resolve-Path -LiteralPath '.pytest_deps').Path
 Latest local result:
 
 ```text
-47 passed, 2 skipped, 4 warnings in 1.45s
+49 passed, 2 skipped, 4 warnings in 5.80s
 ```
 
 ## Phase 1.0 Oracle Framework
@@ -229,6 +229,25 @@ train root does not exist: \kaggle\input\competitions\biohub-cell-tracking-durin
 ```
 
 So official integration skipped locally and no oracle CSVs were created here. In Kaggle, the framework uses `open_dataset(..., normalize=False, require_tracks=True, load_image=False)` and official `tracking_cellmot` metrics when available. Local tests are non-official dependency-light checks only.
+
+Kaggle Oracle execution status:
+
+- limit 1 run succeeded.
+- `--prefer-divisions --limit 20` run succeeded.
+- output directory: `/kaggle/working/oracle_divisions`
+
+Runtime bridge fixes made permanent after the Kaggle run:
+
+- `tracksdata.graph.IndexedRXGraph` is now preferred when available because current `RustWorkXGraph`/`InMemoryGraph` does not support custom node indices. This preserves official dataset-local `node_id` values when rebuilding graphs from submission rows.
+- node and edge attribute-key registration now ignores `ValueError` messages containing `already exists`, because current `tracksdata` may predefine attributes such as `t`, `z`, `y`, and `x`. Other `ValueError`s are still re-raised.
+- Local fallback behavior is unchanged when `tracksdata` or `polars` is unavailable.
+
+Kaggle Oracle findings:
+
+- node dropout strongly reduces score.
+- edge swap strongly reduces score.
+- coordinate jitter is tolerated up to about `1-2 um`.
+- division removal costs about `0.10` score on division-containing samples.
 
 ## Remaining Open Questions
 

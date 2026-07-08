@@ -1,8 +1,11 @@
 import math
+import sys
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
+import src.evaluation.official_bridge as official_bridge
 from src.evaluation.official_bridge import (
     sequence_graph_from_records,
     submission_df_to_tracksdata,
@@ -138,6 +141,68 @@ def test_read_estimated_number_of_nodes_missing_warns(tmp_path) -> None:
 
     with pytest.warns(RuntimeWarning, match="estimated_number_of_nodes not found"):
         assert read_estimated_number_of_nodes(geff) is None
+
+
+def test_tracksdata_builder_prefers_indexed_graph_and_ignores_predefined_attrs(monkeypatch) -> None:
+    class FakeIndexedRXGraph:
+        def __init__(self) -> None:
+            self.node_attr_keys = {"t", "z", "y", "x"}
+            self.nodes: list[dict[str, object]] = []
+            self.indices: list[int] = []
+            self.edges: list[dict[str, int]] = []
+
+        def add_node_attr_key(self, key, dtype, default_value=None) -> None:
+            if key in self.node_attr_keys:
+                raise ValueError(f"Attribute key {key} already exists")
+            self.node_attr_keys.add(key)
+
+        def add_edge_attr_key(self, key, dtype, default_value=None) -> None:
+            raise AssertionError("edge attr keys are not registered by the bridge yet")
+
+        def bulk_add_nodes(self, nodes, indices=None) -> None:
+            self.nodes = list(nodes)
+            self.indices = list(indices)
+
+        def bulk_add_edges(self, edges) -> None:
+            self.edges = list(edges)
+
+    class FakeInMemoryGraph:
+        def __init__(self) -> None:
+            raise AssertionError("IndexedRXGraph should be preferred when available")
+
+    fake_tracksdata = SimpleNamespace(
+        graph=SimpleNamespace(IndexedRXGraph=FakeIndexedRXGraph, InMemoryGraph=FakeInMemoryGraph)
+    )
+    fake_polars = SimpleNamespace(Int64=object(), Float64=object())
+    monkeypatch.setitem(sys.modules, "polars", fake_polars)
+    monkeypatch.setattr(official_bridge, "_tracksdata", fake_tracksdata)
+
+    df = tracksdata_to_submission_df({"dataset_a": make_roundtrip_graphs()["dataset_a"]})
+    graphs = submission_df_to_tracksdata(df)
+
+    graph = graphs["dataset_a"]
+    assert isinstance(graph, FakeIndexedRXGraph)
+    assert graph.indices == [1, 2, 3]
+    assert graph.nodes == [
+        {"t": 0, "z": 10.0, "y": 20.0, "x": 30.0},
+        {"t": 1, "z": 11.0, "y": 20.0, "x": 30.0},
+        {"t": 1, "z": 12.0, "y": 21.0, "x": 31.0},
+    ]
+    assert graph.edges == [{"source_id": 1, "target_id": 2}, {"source_id": 1, "target_id": 3}]
+
+
+def test_safe_attr_helpers_reraise_unexpected_value_errors() -> None:
+    class FakeGraph:
+        def add_node_attr_key(self, key, dtype, default_value=None) -> None:
+            raise ValueError("different failure")
+
+        def add_edge_attr_key(self, key, dtype, default_value=None) -> None:
+            raise ValueError("different failure")
+
+    with pytest.raises(ValueError, match="different failure"):
+        official_bridge._safe_add_node_attr_key(FakeGraph(), "t", object(), default_value=0)
+    with pytest.raises(ValueError, match="different failure"):
+        official_bridge._safe_add_edge_attr_key(FakeGraph(), "source_id", object(), default_value=-1)
 
 
 def test_tracking_cellmot_cross_check_skips_when_unavailable() -> None:

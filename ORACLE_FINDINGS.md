@@ -31,6 +31,13 @@ python -m src.oracle.oracle_experiments \
   --prefer-divisions
 ```
 
+Kaggle runtime verification:
+
+- limit 1 run succeeded.
+- `--prefer-divisions --limit 20` run succeeded.
+- output directory: `/kaggle/working/oracle_divisions`
+- required bridge hotfixes: prefer `tracksdata.graph.IndexedRXGraph` for explicit submission `node_id` indices, and ignore duplicate attr-key registration errors containing `already exists`.
+
 ## Expected Outputs
 
 - `node_dropout.csv`
@@ -48,7 +55,7 @@ outputs/oracle/
 Kaggle path:
 
 ```text
-/kaggle/working/oracle/
+/kaggle/working/oracle_divisions/
 ```
 
 ## Experiments
@@ -65,12 +72,19 @@ Kaggle path:
 
 ## Strategic Reading
 
-Expected levers to rank after Kaggle run:
+Observed levers after the Kaggle Oracle run:
 
 1. node recall
-2. spatial accuracy near the 7 um threshold
-3. edge correctness
+2. edge correctness
+3. spatial accuracy near the 7 um threshold
 4. node-count calibration through `T_pred`
 5. divisions
+
+Key findings:
+
+- node dropout strongly reduces score.
+- edge swap strongly reduces score.
+- coordinate jitter is tolerated up to about `1-2 um`.
+- division removal costs about `0.10` score on division-containing samples.
 
 Sparse-GT warning: self-evaluation scores above `1.0` are ceiling artifacts caused by `pred == GT` and tiny annotated graphs compared with `T_true`; they are not real model progress signals.
