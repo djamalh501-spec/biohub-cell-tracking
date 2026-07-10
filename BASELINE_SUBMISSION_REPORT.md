@@ -24,6 +24,19 @@ It regenerates `id` as `0..N-1`, keeps `node_id` local to each dataset, emits of
 
 `--mode eval-on-train` runs the same classical detector on train Zarr stores that have paired GEFF annotations, then evaluates with the existing official-style metric helper. If train data or optional official dependencies are unavailable, it skips cleanly.
 
+Eval-on-train now supports the real Kaggle GEFF node-property layout observed with `zarr 3.2.1`:
+
+```text
+edges/ids | shape=(50, 2) | dtype=uint64
+nodes/ids | shape=(52,) | dtype=uint64
+nodes/props/t/values | shape=(52,) | dtype=int64
+nodes/props/z/values | shape=(52,) | dtype=int64
+nodes/props/y/values | shape=(52,) | dtype=int64
+nodes/props/x/values | shape=(52,) | dtype=int64
+```
+
+The previous blocker was an assumption that `nodes/props` was directly readable as an array/table. The decoder now keeps that legacy path, but falls back to the official grouped property arrays above.
+
 ## Classical Strategy
 
 For each dataset, the baseline:
@@ -86,7 +99,9 @@ python -m src.baseline.make_baseline_submission \
 
 ## Eval-On-Train Status
 
-The CLI supports `--mode eval-on-train`, but this local workspace does not contain Kaggle train Zarr/GEFF data. Run it inside Kaggle with:
+The CLI supports `--mode eval-on-train`, but this local workspace does not contain Kaggle train Zarr/GEFF data. If `tracking_cellmot` is unavailable, eval-on-train decodes paired train GEFF graphs and then skips official scoring with a clear warning.
+
+Run it inside Kaggle with:
 
 ```bash
 python -m src.baseline.make_baseline_submission \
@@ -98,3 +113,11 @@ python -m src.baseline.make_baseline_submission \
 ## Test Status
 
 Baseline tests currently pass locally on synthetic fixtures. Full-suite output is recorded in the final task response.
+
+Verified Kaggle Phase 1.1 status before this fix:
+
+- smoke mode succeeded on real test data
+- classical mode `--limit 1` succeeded on real test Zarr
+- `44b6_0113de3b` resolved `array=0`, `shape=(100,64,256,256)`
+- submission validation passed
+- with `--max-detections-per-frame 150`, the limit-1 output contained `15000` nodes and `9085` edges

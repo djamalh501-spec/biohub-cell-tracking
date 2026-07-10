@@ -60,6 +60,31 @@ def test_read_geff_graph_from_structured_props_fixture(tmp_path) -> None:
     assert graph.nodes[1].z == 11.0
 
 
+def test_read_geff_graph_from_official_grouped_props_fixture(tmp_path) -> None:
+    geff = tmp_path / "official.geff"
+    (geff / "nodes" / "props").mkdir(parents=True)
+    (geff / "edges").mkdir(parents=True)
+    np.save(geff / "nodes" / "ids.npy", np.asarray([1, 2, 3], dtype=np.uint64))
+    for field in ("t", "z", "y", "x"):
+        (geff / "nodes" / "props" / field).mkdir(parents=True)
+    np.save(geff / "nodes" / "props" / "t" / "values.npy", np.asarray([0, 1, 1], dtype=np.int64))
+    np.save(geff / "nodes" / "props" / "z" / "values.npy", np.asarray([10, 11, 12], dtype=np.int64))
+    np.save(geff / "nodes" / "props" / "y" / "values.npy", np.asarray([20, 20, 21], dtype=np.int64))
+    np.save(geff / "nodes" / "props" / "x" / "values.npy", np.asarray([30, 30, 31], dtype=np.int64))
+    np.save(geff / "edges" / "ids.npy", np.asarray([[1, 2], [1, 3]], dtype=np.uint64))
+
+    graph = read_geff_graph(geff, dataset="official")
+
+    assert graph.sequence_id == "official"
+    assert [node.node_id for node in graph.nodes] == ["1", "2", "3"]
+    assert [(node.time, node.z, node.y, node.x) for node in graph.nodes] == [
+        (0, 10.0, 20.0, 30.0),
+        (1, 11.0, 20.0, 30.0),
+        (1, 12.0, 21.0, 31.0),
+    ]
+    assert [(edge.parent_id, edge.child_id) for edge in graph.edges] == [("1", "2"), ("1", "3")]
+
+
 def test_extract_divisions_infers_exactly_two_children(tmp_path) -> None:
     geff = tmp_path / "division.geff"
     make_geff_fixture(geff)

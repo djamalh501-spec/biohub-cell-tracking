@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from src.evaluation.geff import read_geff_graph
+from src.evaluation import official_metric as official_metric_module
 from src.evaluation.official_metric import evaluate_datasets_official_style, read_estimated_number_of_nodes
 from src.evaluation.schema import DEFAULT_VOXEL_SPACING_UM, CellNode, SequenceGraph, TemporalEdge
 from src.evaluation.validator import OFFICIAL_SUBMISSION_COLUMNS, regenerate_official_row_ids, validate_submission
@@ -437,6 +438,13 @@ def run_eval_on_train(args: argparse.Namespace) -> int:
             t_true_map[path.stem] = t_true
     if not pairs:
         LOGGER.warning("no train datasets with GEFF annotations were evaluated")
+        return 0
+    if official_metric_module.evaluate is None:
+        LOGGER.warning(
+            "tracking_cellmot is unavailable; decoded %d train GEFF graph(s), "
+            "but skipping official eval-on-train scoring.",
+            len(pairs),
+        )
         return 0
     summary = evaluate_datasets_official_style(pairs, t_true_map=t_true_map)
     for result in summary.per_dataset:

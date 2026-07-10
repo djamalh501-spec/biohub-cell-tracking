@@ -192,6 +192,35 @@ def _decode_node_properties(props: np.ndarray, attrs: dict[str, Any]) -> dict[st
     return {field: np.asarray(props[:, index]) for field, index in indices.items()}
 
 
+def _read_grouped_node_property(store: Path, field: str) -> np.ndarray:
+    paths = [f"nodes/props/{alias}/values" for alias in NODE_PROP_ALIASES[field]]
+    failures: list[str] = []
+    for array_path in paths:
+        try:
+            return np.asarray(_read_array(store, array_path)).reshape(-1)
+        except FileNotFoundError as exc:
+            failures.append(str(exc))
+    raise FileNotFoundError(
+        f"could not read GEFF grouped node property {field!r}; tried {paths}. "
+        f"Last error: {failures[-1] if failures else 'no paths tried'}"
+    )
+
+
+def _read_node_properties(store: Path) -> dict[str, np.ndarray]:
+    """Read GEFF node properties from legacy table or official grouped layout."""
+
+    try:
+        props = np.asarray(_read_array(store, "nodes/props"))
+    except FileNotFoundError as table_error:
+        grouped = {field: _read_grouped_node_property(store, field) for field in ("t", "z", "y", "x")}
+        lengths = {field: len(values) for field, values in grouped.items()}
+        if len(set(lengths.values())) != 1:
+            raise ValueError(f"grouped nodes/props lengths differ: {lengths}") from table_error
+        return grouped
+    prop_attrs = _array_attrs(store / "nodes" / "props")
+    return _decode_node_properties(props, prop_attrs)
+
+
 def _decode_edge_ids(edge_ids: np.ndarray) -> np.ndarray:
     if edge_ids.size == 0:
         return np.empty((0, 2), dtype=edge_ids.dtype)
@@ -212,9 +241,7 @@ def read_geff_graph(path: str | Path, dataset: str | None = None) -> SequenceGra
         raise FileNotFoundError(f"GEFF store does not exist: {store}")
     dataset_id = dataset or store.name.removesuffix(".geff")
     node_ids = np.asarray(_read_array(store, "nodes/ids")).reshape(-1)
-    props = np.asarray(_read_array(store, "nodes/props"))
-    prop_attrs = _array_attrs(store / "nodes" / "props")
-    decoded_props = _decode_node_properties(props, prop_attrs)
+    decoded_props = _read_node_properties(store)
     if len(node_ids) != len(decoded_props["t"]):
         raise ValueError(f"nodes/ids length {len(node_ids)} does not match nodes/props length {len(decoded_props['t'])}")
 
