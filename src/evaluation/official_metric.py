@@ -149,7 +149,7 @@ def evaluate_one_dataset(
     """
 
     if evaluate is not None:
-        LOGGER.warning("tracking_cellmot is installed, but local SequenceGraph bridge uses fallback counts.")
+        LOGGER.warning("FALLBACK scoring: local SequenceGraph counts are being used instead of tracking_cellmot graph metrics.")
 
     edge_tp, edge_fp, edge_fn = _edge_counts_official_fallback(pred_graph, gt_graph, scale)
     edge_j = _jaccard(edge_tp, edge_fp, edge_fn)

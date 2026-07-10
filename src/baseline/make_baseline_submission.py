@@ -15,9 +15,15 @@ import pandas as pd
 
 from src.evaluation.geff import read_geff_graph
 from src.evaluation import official_metric as official_metric_module
+from src.evaluation.official_bridge import submission_df_to_tracksdata
 from src.evaluation.official_metric import evaluate_datasets_official_style, read_estimated_number_of_nodes
 from src.evaluation.schema import DEFAULT_VOXEL_SPACING_UM, CellNode, SequenceGraph, TemporalEdge
 from src.evaluation.validator import OFFICIAL_SUBMISSION_COLUMNS, regenerate_official_row_ids, validate_submission
+
+try:  # pragma: no cover - optional Kaggle dependency.
+    from tracking_cellmot.io import open_dataset  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - expected locally.
+    open_dataset = None
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_SCALE_ZYX = DEFAULT_VOXEL_SPACING_UM
@@ -418,12 +424,73 @@ def run_classical(args: argparse.Namespace) -> int:
     return 0
 
 
+def _official_scoring_available() -> bool:
+    return (
+        open_dataset is not None
+        and official_metric_module.evaluate is not None
+        and official_metric_module.node_recall is not None
+        and official_metric_module.per_sample_metrics is not None
+        and official_metric_module.summarise is not None
+    )
+
+
+def _score_from_metric_row(row: dict) -> float:
+    adjusted = float(row.get("adj_edge_jaccard", math.nan))
+    if math.isnan(adjusted):
+        return math.nan
+    division_tp = float(row.get("division_tp", 0) or 0)
+    division_fp = float(row.get("division_fp", 0) or 0)
+    division_fn = float(row.get("division_fn", 0) or 0)
+    division_total = division_tp + division_fp + division_fn
+    if division_total == 0:
+        return adjusted
+    return adjusted + 0.1 * (division_tp / division_total)
+
+
+def _format_metric(value: object) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "NA"
+    return "nan" if math.isnan(number) else f"{number:.5f}"
+
+
+def _print_official_row(dataset: str, row: dict, t_pred: int, t_true: float | None) -> None:
+    ratio = t_pred / t_true if t_true else math.nan
+    print(
+        f"OFFICIAL {dataset}: edge_jaccard={_format_metric(row.get('edge_jaccard'))} "
+        f"adj_edge_jaccard={_format_metric(row.get('adj_edge_jaccard'))} "
+        f"node_recall={_format_metric(row.get('node_recall'))} "
+        f"division_tp={row.get('division_tp', 'NA')} division_fp={row.get('division_fp', 'NA')} "
+        f"division_fn={row.get('division_fn', 'NA')} T_pred={t_pred} T_true={t_true} "
+        f"T_pred/T_true={_format_metric(ratio)} score={_format_metric(_score_from_metric_row(row))}"
+    )
+
+
+def _print_fallback_result(result) -> None:
+    ratio = result.t_pred / result.t_true if result.t_true else math.nan
+    print(
+        f"FALLBACK {result.dataset}: edge_jaccard={result.edge_jaccard:.5f} "
+        f"adj_edge_jaccard={_format_metric(result.adjusted_edge_jaccard)} "
+        f"node_recall=NA division_jaccard={_format_metric(result.division_jaccard)} "
+        f"T_pred={result.t_pred} T_true={result.t_true} "
+        f"T_pred/T_true={_format_metric(ratio)} score={_format_metric(result.final_score)}"
+    )
+
+
 def run_eval_on_train(args: argparse.Namespace) -> int:
     if args.train_root is None or not args.train_root.exists():
         LOGGER.warning("train root unavailable; skipping eval-on-train: %s", args.train_root)
         return 0
-    pairs: list[tuple[SequenceGraph, SequenceGraph]] = []
+    official_rows: list[dict] = []
+    fallback_pairs: list[tuple[SequenceGraph, SequenceGraph]] = []
     t_true_map: dict[str, float] = {}
+    use_official = _official_scoring_available()
+    if use_official:
+        LOGGER.info("eval-on-train scoring mode: OFFICIAL tracking_cellmot")
+    else:
+        LOGGER.warning("eval-on-train scoring mode: FALLBACK local SequenceGraph counts; official packages unavailable")
+
     for path in _limit_paths(discover_zarr_datasets(args.train_root), args.limit):
         geff_path = path.with_suffix(".geff")
         if not geff_path.exists():
@@ -431,33 +498,40 @@ def run_eval_on_train(args: argparse.Namespace) -> int:
             continue
         info = inspect_zarr_image(path)
         pred = make_classical_graph(info, args)
-        gt = read_geff_graph(geff_path, dataset=path.stem)
-        pairs.append((pred, gt))
         t_true = read_estimated_number_of_nodes(geff_path)
         if t_true is not None:
             t_true_map[path.stem] = t_true
-    if not pairs:
+        if use_official:
+            pred_df = graphs_to_submission([pred])
+            pred_graph = submission_df_to_tracksdata(pred_df)[path.stem]
+            dataset = open_dataset(path.parent / path.stem, normalize=False, require_tracks=True, load_image=False)
+            gt_graph = dataset.tracks
+            scale = tuple(dataset.scale)
+            er = official_metric_module.evaluate(pred_graph, gt_graph, scale=scale)
+            recall = official_metric_module.node_recall(pred_graph, gt_graph)
+            row = official_metric_module.per_sample_metrics(er, float("nan") if t_true is None else t_true, recall)
+            official_rows.append(row)
+            _print_official_row(path.stem, row, len(pred.nodes), t_true)
+        else:
+            gt = read_geff_graph(geff_path, dataset=path.stem)
+            fallback_pairs.append((pred, gt))
+    if use_official:
+        if not official_rows:
+            LOGGER.warning("no train datasets were evaluated with official scoring")
+            return 0
+        summary = official_metric_module.summarise(official_rows)
+        print(f"OFFICIAL summary: {summary}")
+        return 0
+
+    if not fallback_pairs:
         LOGGER.warning("no train datasets with GEFF annotations were evaluated")
         return 0
-    if official_metric_module.evaluate is None:
-        LOGGER.warning(
-            "tracking_cellmot is unavailable; decoded %d train GEFF graph(s), "
-            "but skipping official eval-on-train scoring.",
-            len(pairs),
-        )
-        return 0
-    summary = evaluate_datasets_official_style(pairs, t_true_map=t_true_map)
+    summary = evaluate_datasets_official_style(fallback_pairs, t_true_map=t_true_map)
     for result in summary.per_dataset:
-        ratio = result.t_pred / result.t_true if result.t_true else math.nan
-        print(
-            f"{result.dataset}: edge_jaccard={result.edge_jaccard:.5f} "
-            f"adj_edge_jaccard={result.adjusted_edge_jaccard:.5f} "
-            f"node_recall=NA T_pred={result.t_pred} T_true={result.t_true} "
-            f"T_pred/T_true={ratio:.5f} score={result.final_score:.5f}"
-        )
+        _print_fallback_result(result)
     print(
-        f"summary: adj_edge_jaccard={summary.adjusted_edge_jaccard:.5f} "
-        f"division_jaccard={summary.division_jaccard:.5f} score={summary.final_score:.5f}"
+        f"FALLBACK summary: adj_edge_jaccard={_format_metric(summary.adjusted_edge_jaccard)} "
+        f"division_jaccard={_format_metric(summary.division_jaccard)} score={_format_metric(summary.final_score)}"
     )
     return 0
 

@@ -99,7 +99,13 @@ python -m src.baseline.make_baseline_submission \
 
 ## Eval-On-Train Status
 
-The CLI supports `--mode eval-on-train`, but this local workspace does not contain Kaggle train Zarr/GEFF data. If `tracking_cellmot` is unavailable, eval-on-train decodes paired train GEFF graphs and then skips official scoring with a clear warning.
+The CLI supports `--mode eval-on-train`, but this local workspace does not contain Kaggle train Zarr/GEFF data. If `tracking_cellmot` is available, eval-on-train now prefers the official scoring path:
+
+- load GT with `tracking_cellmot.io.open_dataset(..., normalize=False, require_tracks=True, load_image=False)`
+- convert predicted submission rows through `submission_df_to_tracksdata`
+- score with `tracking_cellmot.metrics.evaluate`, `node_recall`, `per_sample_metrics`, and `summarise`
+
+If official packages are unavailable, eval-on-train uses local `SequenceGraph` fallback counts and labels output as `FALLBACK`.
 
 Run it inside Kaggle with:
 
@@ -109,6 +115,17 @@ python -m src.baseline.make_baseline_submission \
   --mode eval-on-train \
   --limit 5
 ```
+
+First Kaggle fallback result before the official scoring preference was added:
+
+```text
+44b6_0113de3b: edge_jaccard=0.45902 adj_edge_jaccard=0.46781 node_recall=NA T_pred=20819 T_true=25755.0 T_pred/T_true=0.80835 score=0.46781
+44b6_0b24845f: edge_jaccard=0.04000 adj_edge_jaccard=0.04228 node_recall=NA T_pred=14087 T_true=32795.0 T_pred/T_true=0.42955 score=0.04228
+44b6_0c582fdc: edge_jaccard=0.04110 adj_edge_jaccard=0.04285 node_recall=NA T_pred=16017 T_true=27958.0 T_pred/T_true=0.57290 score=0.04285
+summary: adj_edge_jaccard=0.18358 division_jaccard=nan score=0.18358
+```
+
+Those fallback numbers were useful for calibration but not fully official. The low `T_pred/T_true` values, especially `0.42955` and `0.57290`, suggest the current classical detector is under-detecting on some datasets; recall-oriented tuning remains the next practical lever.
 
 ## Test Status
 

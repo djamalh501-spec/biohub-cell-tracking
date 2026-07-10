@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 
+import src.baseline.make_baseline_submission as baseline
 from src.baseline.make_baseline_submission import (
     Detection,
     detect_frame_peaks,
@@ -8,7 +9,9 @@ from src.baseline.make_baseline_submission import (
     graphs_to_submission,
     link_detections_one_to_one,
     main,
+    run_eval_on_train,
 )
+from src.evaluation.official_bridge import sequence_graph_from_records
 from src.evaluation.validator import OFFICIAL_SUBMISSION_COLUMNS, validate_submission
 
 
@@ -163,3 +166,79 @@ def test_linker_has_no_duplicate_targets_in_one_step() -> None:
     edges = link_detections_one_to_one(detections_by_t, scale_zyx_um=(1.0, 1.0, 1.0), link_max_um=5.0)
     targets = [target for _, target in edges]
     assert len(targets) == len(set(targets))
+
+
+def test_eval_on_train_prefers_official_scoring_when_available(tmp_path, monkeypatch, capsys) -> None:
+    train_root = tmp_path / "train"
+    train_root.mkdir()
+    zarr_path = train_root / "dataset_a.zarr"
+    zarr_path.mkdir()
+    np.save(zarr_path / "volume.npy", np.zeros((1, 2, 4, 4), dtype=np.uint16))
+    (train_root / "dataset_a.geff").mkdir()
+    pred_graph = sequence_graph_from_records("dataset_a", [(1, 0, 0, 0, 0)], [])
+    gt_graph = object()
+    pred_tracks_graph = object()
+    calls = {"bridge": 0, "open_dataset": 0, "evaluate": 0, "fallback_geff": 0}
+
+    monkeypatch.setattr(baseline, "make_classical_graph", lambda info, args: pred_graph)
+    monkeypatch.setattr(baseline, "read_estimated_number_of_nodes", lambda path: 10.0)
+
+    def fake_submission_df_to_tracksdata(df):
+        calls["bridge"] += 1
+        assert tuple(df.columns) == OFFICIAL_SUBMISSION_COLUMNS
+        return {"dataset_a": pred_tracks_graph}
+
+    def fake_open_dataset(path, normalize, require_tracks, load_image):
+        calls["open_dataset"] += 1
+        assert path == train_root / "dataset_a"
+        assert normalize is False
+        assert require_tracks is True
+        assert load_image is False
+        return type("Dataset", (), {"tracks": gt_graph, "scale": (1.0, 1.0, 1.0)})()
+
+    def fake_evaluate(pred, gt, scale):
+        calls["evaluate"] += 1
+        assert pred is pred_tracks_graph
+        assert gt is gt_graph
+        assert scale == (1.0, 1.0, 1.0)
+        return object()
+
+    monkeypatch.setattr(baseline, "submission_df_to_tracksdata", fake_submission_df_to_tracksdata)
+    monkeypatch.setattr(baseline, "open_dataset", fake_open_dataset)
+    monkeypatch.setattr(baseline, "read_geff_graph", lambda *args, **kwargs: calls.__setitem__("fallback_geff", 1))
+    monkeypatch.setattr(baseline.official_metric_module, "evaluate", fake_evaluate)
+    monkeypatch.setattr(baseline.official_metric_module, "node_recall", lambda pred, gt: 0.5)
+    monkeypatch.setattr(
+        baseline.official_metric_module,
+        "per_sample_metrics",
+        lambda er, t_true, recall: {
+            "edge_jaccard": 0.25,
+            "adj_edge_jaccard": 0.3,
+            "node_recall": recall,
+            "division_tp": 0,
+            "division_fp": 0,
+            "division_fn": 0,
+        },
+    )
+    monkeypatch.setattr(baseline.official_metric_module, "summarise", lambda rows: {"score": 0.3, "n": len(rows)})
+
+    args = type(
+        "Args",
+        (),
+        {
+            "train_root": train_root,
+            "limit": 1,
+            "threshold_percentile": 99.5,
+            "min_distance_xy": 5,
+            "min_distance_z": 2,
+            "max_detections_per_frame": 10,
+            "sigma": 0,
+            "link_max_um": 5.0,
+        },
+    )()
+
+    assert run_eval_on_train(args) == 0
+    output = capsys.readouterr().out
+    assert "OFFICIAL dataset_a" in output
+    assert "OFFICIAL summary" in output
+    assert calls == {"bridge": 1, "open_dataset": 1, "evaluate": 1, "fallback_geff": 0}
