@@ -1,16 +1,25 @@
 import pandas as pd
 import numpy as np
+from types import SimpleNamespace
 
 import src.baseline.make_baseline_submission as baseline
+import src.baseline.sweep_adaptive as sweep
 from src.baseline.make_baseline_submission import (
     Detection,
+    adaptive_target_count,
+    build_parser,
+    causal_rolling_median_target,
     detect_frame_peaks,
+    detect_frame_peaks_adaptive,
     graph_from_detections,
     graphs_to_submission,
+    inspect_zarr_image,
     link_detections_one_to_one,
     main,
+    make_classical_graph,
     run_eval_on_train,
 )
+from src.baseline.sweep_adaptive import parse_official_summary
 from src.evaluation.official_bridge import sequence_graph_from_records
 from src.evaluation.validator import OFFICIAL_SUBMISSION_COLUMNS, validate_submission
 
@@ -147,6 +156,266 @@ def test_classical_detector_is_deterministic_on_known_blobs() -> None:
 
     assert first == second
     assert [(det.z, det.y, det.x) for det in first] == [(1, 4, 5), (1, 10, 11)]
+
+
+def test_detection_policy_cli_defaults_to_fixed() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--mode", "classical", "--test-root", "test"])
+    assert args.detection_policy == "fixed"
+    assert args.adaptive_mad_k == 3.0
+    assert args.adaptive_min_detections == 80
+    assert args.adaptive_max_detections == 400
+    assert args.adaptive_count_smoothing_window == 5
+
+
+def test_fixed_policy_regression_uses_reference_detector(tmp_path, monkeypatch) -> None:
+    store = tmp_path / "dataset_a.zarr"
+    store.mkdir()
+    frame = np.zeros((1, 3, 16, 16), dtype=np.float32)
+    frame[0, 1, 4, 5] = 10
+    frame[0, 1, 10, 11] = 8
+    np.save(store / "volume.npy", frame)
+    monkeypatch.setattr(
+        baseline,
+        "detect_frame_peaks_adaptive",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("adaptive detector called in fixed mode")),
+    )
+    args = SimpleNamespace(
+        detection_policy="fixed",
+        threshold_percentile=99.0,
+        min_distance_xy=2,
+        min_distance_z=1,
+        max_detections_per_frame=5,
+        sigma=0,
+        link_max_um=2.0,
+    )
+    graph = make_classical_graph(inspect_zarr_image(store), args)
+    assert [(node.time, node.z, node.y, node.x) for node in graph.nodes] == [
+        (0, 1.0, 4.0, 5.0),
+        (0, 1.0, 10.0, 11.0),
+    ]
+
+
+def test_adaptive_target_count_respects_bounds() -> None:
+    scores = np.arange(1, 1001, dtype=float)
+    lower_target, _ = adaptive_target_count(scores, mad_k=100.0, minimum=80, maximum=400)
+    upper_target, _ = adaptive_target_count(scores, mad_k=0.0, minimum=80, maximum=400)
+    assert lower_target == 80
+    assert upper_target == 400
+
+
+def test_adaptive_target_count_handles_zero_mad_and_nonfinite_scores() -> None:
+    target, threshold = adaptive_target_count(
+        [1.0, 1.0, 1.0, 1.0, np.nan, np.inf],
+        mad_k=3.0,
+        minimum=3,
+        maximum=10,
+    )
+    assert threshold == 1.0
+    assert target == 3
+
+
+def test_adaptive_detector_handles_empty_candidate_frame() -> None:
+    detections, next_node_id, diagnostics = detect_frame_peaks_adaptive(
+        np.zeros((2, 8, 8), dtype=np.float32),
+        t=0,
+        next_node_id=1,
+        threshold_percentile=99.7,
+        min_distance_xy=2,
+        min_distance_z=1,
+        sigma=0,
+        adaptive_mad_k=3.0,
+        adaptive_min_detections=2,
+        adaptive_max_detections=5,
+        adaptive_count_smoothing_window=5,
+        raw_target_history=[],
+    )
+    assert detections == []
+    assert next_node_id == 1
+    assert diagnostics.candidate_count == 0
+    assert diagnostics.raw_target == 0
+    assert diagnostics.selected_count == 0
+
+
+def test_adaptive_detector_is_deterministic() -> None:
+    frame = np.zeros((3, 16, 16), dtype=np.float32)
+    frame[1, 3, 4] = 10
+    frame[1, 8, 9] = 8
+    frame[1, 13, 13] = 6
+    kwargs = {
+        "t": 0,
+        "next_node_id": 1,
+        "threshold_percentile": 90.0,
+        "min_distance_xy": 2,
+        "min_distance_z": 1,
+        "sigma": 0,
+        "adaptive_mad_k": 3.0,
+        "adaptive_min_detections": 2,
+        "adaptive_max_detections": 3,
+        "adaptive_count_smoothing_window": 3,
+        "raw_target_history": [],
+    }
+    assert detect_frame_peaks_adaptive(frame, **kwargs) == detect_frame_peaks_adaptive(frame, **kwargs)
+
+
+def test_causal_count_smoothing_uses_available_history() -> None:
+    assert causal_rolling_median_target([10], 5) == 10
+    assert causal_rolling_median_target([10, 100], 5) == 55
+    assert causal_rolling_median_target([10, 100, 20], 3) == 20
+    assert causal_rolling_median_target([10, 100, 20, 30], 3) == 30
+
+
+def test_adaptive_mode_writes_valid_submission_for_dynamic_datasets(tmp_path) -> None:
+    test_root = tmp_path / "test"
+    test_root.mkdir()
+    for index, dataset in enumerate(("unseen_alpha", "unseen_beta")):
+        store = test_root / f"{dataset}.zarr"
+        store.mkdir()
+        volume = np.zeros((2, 2, 8, 8), dtype=np.float32)
+        volume[:, 0, 2, 2] = 10 + index
+        volume[:, 1, 6, 6] = 8 + index
+        np.save(store / "volume.npy", volume)
+    sample = tmp_path / "sample_submission.csv"
+    output = tmp_path / "submission.csv"
+    _sample_submission(sample, datasets=("unseen_alpha", "unseen_beta"))
+
+    result = main(
+        [
+            "--mode",
+            "classical",
+            "--test-root",
+            str(test_root),
+            "--sample-submission",
+            str(sample),
+            "--output",
+            str(output),
+            "--detection-policy",
+            "adaptive-count",
+            "--threshold-percentile",
+            "90",
+            "--sigma",
+            "0",
+            "--min-distance-xy",
+            "1",
+            "--min-distance-z",
+            "0",
+            "--adaptive-min-detections",
+            "1",
+            "--adaptive-max-detections",
+            "2",
+            "--adaptive-count-smoothing-window",
+            "1",
+        ]
+    )
+    assert result == 0
+    assert validate_submission(output, sample).errors == ()
+    submission = pd.read_csv(output)
+    assert tuple(submission.columns) == OFFICIAL_SUBMISSION_COLUMNS
+    assert set(submission["dataset"]) == {"unseen_alpha", "unseen_beta"}
+
+
+def test_sweep_summary_parser() -> None:
+    output = (
+        "OFFICIAL sweep_metrics: dataset_count=3 score=0.18003 "
+        "node_recall=0.25000 adj_edge_jaccard=0.18003\n"
+    )
+    assert parse_official_summary(output) == {
+        "dataset_count": 3,
+        "official_summary_score": 0.18003,
+        "node_recall": 0.25,
+        "adjusted_edge_jaccard": 0.18003,
+    }
+
+
+def test_sweep_propagates_parameters_and_writes_success_csv(tmp_path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "OFFICIAL sweep_metrics: dataset_count=3 score=0.18123456789 "
+                "node_recall=0.25 adj_edge_jaccard=0.18123456789\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(sweep.subprocess, "run", fake_run)
+    output = tmp_path / "sweep.csv"
+    result = sweep.main(
+        [
+            "--train-root",
+            str(tmp_path / "train"),
+            "--output",
+            str(output),
+            "--limit",
+            "3",
+            "--config",
+            "2.75,350,6.0",
+            "--threshold-percentile",
+            "99.6",
+            "--sigma",
+            "1.25",
+            "--min-distance-xy",
+            "6",
+            "--min-distance-z",
+            "3",
+            "--adaptive-min-detections",
+            "70",
+            "--adaptive-count-smoothing-window",
+            "7",
+            "--seed",
+            "123",
+        ]
+    )
+    assert result == 0
+    command = captured["command"]
+    assert isinstance(command, list)
+    for option, value in (
+        ("--detection-policy", "adaptive-count"),
+        ("--threshold-percentile", "99.6"),
+        ("--sigma", "1.25"),
+        ("--min-distance-xy", "6"),
+        ("--min-distance-z", "3"),
+        ("--adaptive-mad-k", "2.75"),
+        ("--adaptive-min-detections", "70"),
+        ("--adaptive-max-detections", "350"),
+        ("--adaptive-count-smoothing-window", "7"),
+        ("--link-max-um", "6.0"),
+        ("--seed", "123"),
+    ):
+        index = command.index(option)
+        assert command[index + 1] == value
+    assert captured["kwargs"] == {"capture_output": True, "text": True, "check": False}
+    row = pd.read_csv(output).iloc[0]
+    assert row["status"] == "success"
+    assert row["dataset_count"] == 3
+    assert row["official_summary_score"] == 0.18123456789
+
+
+def test_sweep_writes_failure_csv_when_subprocess_cannot_launch(tmp_path, monkeypatch) -> None:
+    def fail_to_launch(*args, **kwargs):
+        raise OSError("runtime unavailable")
+
+    monkeypatch.setattr(sweep.subprocess, "run", fail_to_launch)
+    output = tmp_path / "failed_sweep.csv"
+    result = sweep.main(
+        [
+            "--train-root",
+            str(tmp_path / "train"),
+            "--output",
+            str(output),
+            "--config",
+            "3.0,400,5.0",
+        ]
+    )
+    assert result == 1
+    row = pd.read_csv(output).iloc[0]
+    assert row["status"] == "failure"
+    assert row["return_code"] == -1
+    assert "could not launch eval-on-train subprocess" in row["error"]
 
 
 def test_linker_one_to_one_assignment_recovers_known_correspondences() -> None:

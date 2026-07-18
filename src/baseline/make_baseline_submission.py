@@ -49,6 +49,17 @@ class Detection:
     intensity: float
 
 
+@dataclass(frozen=True, slots=True)
+class AdaptiveFrameDiagnostics:
+    candidate_count: int
+    robust_threshold: float
+    raw_target: int
+    smoothed_target: int
+    selected_count: int
+    hit_lower_bound: bool
+    hit_upper_bound: bool
+
+
 def discover_zarr_datasets(root: str | Path) -> list[Path]:
     path = Path(root)
     if not path.exists():
@@ -237,6 +248,125 @@ def detect_frame_peaks(
     return kept, next_node_id
 
 
+def _adaptive_peak_candidates(
+    frame: np.ndarray,
+    *,
+    threshold_percentile: float,
+    min_distance_xy: int,
+    min_distance_z: int,
+    sigma: float,
+) -> list[tuple[float, int, int, int]]:
+    """Return deterministic, spatially suppressed candidates sorted by score."""
+
+    image = _smooth(robust_normalize(frame), sigma)
+    finite_image = np.where(np.isfinite(image), image, 0.0)
+    threshold = float(np.percentile(finite_image, threshold_percentile))
+    candidate_coords = np.argwhere((finite_image >= threshold) & (finite_image > 0.0))
+    ranked = sorted(
+        (
+            (float(finite_image[tuple(coord)]), int(coord[0]), int(coord[1]), int(coord[2]))
+            for coord in candidate_coords
+        ),
+        key=lambda item: (-item[0], item[1], item[2], item[3]),
+    )
+
+    distance_xy = max(0, int(min_distance_xy))
+    distance_z = max(0, int(min_distance_z))
+    occupied: set[tuple[int, int, int]] = set()
+    kept: list[tuple[float, int, int, int]] = []
+    for score, z, y, x in ranked:
+        too_close = any(
+            (near_z, near_y, near_x) in occupied
+            for near_z in range(z - distance_z, z + distance_z + 1)
+            for near_y in range(y - distance_xy, y + distance_xy + 1)
+            for near_x in range(x - distance_xy, x + distance_xy + 1)
+        )
+        if too_close:
+            continue
+        kept.append((score, z, y, x))
+        occupied.add((z, y, x))
+    return kept
+
+
+def adaptive_target_count(
+    scores: Sequence[float],
+    *,
+    mad_k: float,
+    minimum: int,
+    maximum: int,
+) -> tuple[int, float]:
+    """Return a robust, bounded target count and its score threshold."""
+
+    finite_scores = np.asarray([score for score in scores if math.isfinite(float(score))], dtype=float)
+    if finite_scores.size == 0:
+        return 0, math.nan
+    median = float(np.median(finite_scores))
+    mad = float(np.median(np.abs(finite_scores - median)))
+    robust_threshold = median + float(mad_k) * 1.4826 * mad
+    above_threshold = int(np.count_nonzero(finite_scores > robust_threshold))
+    bounded = min(int(maximum), max(int(minimum), above_threshold))
+    return min(int(finite_scores.size), bounded), robust_threshold
+
+
+def causal_rolling_median_target(targets: Sequence[int], window: int) -> int:
+    """Smooth the latest target using only current and previous frames."""
+
+    if not targets:
+        return 0
+    width = max(1, int(window))
+    median = float(np.median(np.asarray(targets[-width:], dtype=float)))
+    return int(math.floor(median + 0.5))
+
+
+def detect_frame_peaks_adaptive(
+    frame: np.ndarray,
+    *,
+    t: int,
+    next_node_id: int,
+    threshold_percentile: float,
+    min_distance_xy: int,
+    min_distance_z: int,
+    sigma: float,
+    adaptive_mad_k: float,
+    adaptive_min_detections: int,
+    adaptive_max_detections: int,
+    adaptive_count_smoothing_window: int,
+    raw_target_history: Sequence[int],
+) -> tuple[list[Detection], int, AdaptiveFrameDiagnostics]:
+    candidates = _adaptive_peak_candidates(
+        frame,
+        threshold_percentile=threshold_percentile,
+        min_distance_xy=min_distance_xy,
+        min_distance_z=min_distance_z,
+        sigma=sigma,
+    )
+    raw_target, robust_threshold = adaptive_target_count(
+        [candidate[0] for candidate in candidates],
+        mad_k=adaptive_mad_k,
+        minimum=adaptive_min_detections,
+        maximum=adaptive_max_detections,
+    )
+    smoothed_target = causal_rolling_median_target(
+        [*raw_target_history, raw_target],
+        adaptive_count_smoothing_window,
+    )
+    selected_count = min(len(candidates), smoothed_target)
+    detections: list[Detection] = []
+    for score, z, y, x in candidates[:selected_count]:
+        detections.append(Detection(next_node_id, int(t), z, y, x, score))
+        next_node_id += 1
+    diagnostics = AdaptiveFrameDiagnostics(
+        candidate_count=len(candidates),
+        robust_threshold=robust_threshold,
+        raw_target=raw_target,
+        smoothed_target=smoothed_target,
+        selected_count=selected_count,
+        hit_lower_bound=raw_target == adaptive_min_detections,
+        hit_upper_bound=raw_target == adaptive_max_detections,
+    )
+    return detections, next_node_id, diagnostics
+
+
 def _distance_matrix_um(
     parents: Sequence[Detection],
     children: Sequence[Detection],
@@ -372,21 +502,61 @@ def make_smoke_graph(info: ZarrImageInfo) -> SequenceGraph:
 def make_classical_graph(info: ZarrImageInfo, args: argparse.Namespace) -> SequenceGraph:
     LOGGER.info("dataset=%s array=%s shape=%s scale_zyx_um=%s", info.dataset, info.array_path, info.shape, info.scale_zyx_um)
     detections_by_t: dict[int, list[Detection]] = {}
+    adaptive_diagnostics: list[AdaptiveFrameDiagnostics] = []
+    raw_target_history: list[int] = []
+    detection_policy = getattr(args, "detection_policy", "fixed")
     next_node_id = 1
     for t in range(info.shape[0]):
-        detections, next_node_id = detect_frame_peaks(
-            load_timepoint(info, t),
-            t=t,
-            next_node_id=next_node_id,
-            threshold_percentile=args.threshold_percentile,
-            min_distance_xy=args.min_distance_xy,
-            min_distance_z=args.min_distance_z,
-            max_detections=args.max_detections_per_frame,
-            sigma=args.sigma,
-        )
+        frame = load_timepoint(info, t)
+        if detection_policy == "adaptive-count":
+            detections, next_node_id, frame_diagnostics = detect_frame_peaks_adaptive(
+                frame,
+                t=t,
+                next_node_id=next_node_id,
+                threshold_percentile=args.threshold_percentile,
+                min_distance_xy=args.min_distance_xy,
+                min_distance_z=args.min_distance_z,
+                sigma=args.sigma,
+                adaptive_mad_k=args.adaptive_mad_k,
+                adaptive_min_detections=args.adaptive_min_detections,
+                adaptive_max_detections=args.adaptive_max_detections,
+                adaptive_count_smoothing_window=args.adaptive_count_smoothing_window,
+                raw_target_history=raw_target_history,
+            )
+            raw_target_history.append(frame_diagnostics.raw_target)
+            adaptive_diagnostics.append(frame_diagnostics)
+        else:
+            detections, next_node_id = detect_frame_peaks(
+                frame,
+                t=t,
+                next_node_id=next_node_id,
+                threshold_percentile=args.threshold_percentile,
+                min_distance_xy=args.min_distance_xy,
+                min_distance_z=args.min_distance_z,
+                max_detections=args.max_detections_per_frame,
+                sigma=args.sigma,
+            )
         detections_by_t[t] = detections
     edges = link_detections_one_to_one(detections_by_t, scale_zyx_um=info.scale_zyx_um, link_max_um=args.link_max_um)
-    return graph_from_detections(info.dataset, [det for values in detections_by_t.values() for det in values], edges)
+    graph = graph_from_detections(info.dataset, [det for values in detections_by_t.values() for det in values], edges)
+    if adaptive_diagnostics:
+        selected = np.asarray([item.selected_count for item in adaptive_diagnostics], dtype=float)
+        raw_targets = np.asarray([item.raw_target for item in adaptive_diagnostics], dtype=float)
+        smoothed_targets = np.asarray([item.smoothed_target for item in adaptive_diagnostics], dtype=float)
+        LOGGER.info(
+            "adaptive diagnostics dataset=%s T_pred=%d detections/frame mean=%.2f min=%d max=%d "
+            "raw_target_mean=%.2f smoothed_target_mean=%.2f lower_bound_frames=%d upper_bound_frames=%d",
+            info.dataset,
+            len(graph.nodes),
+            float(selected.mean()),
+            int(selected.min()),
+            int(selected.max()),
+            float(raw_targets.mean()),
+            float(smoothed_targets.mean()),
+            sum(item.hit_lower_bound for item in adaptive_diagnostics),
+            sum(item.hit_upper_bound for item in adaptive_diagnostics),
+        )
+    return graph
 
 
 def _limit_paths(paths: list[Path], limit: int | None) -> list[Path]:
@@ -455,6 +625,14 @@ def _format_metric(value: object) -> str:
     return "nan" if math.isnan(number) else f"{number:.5f}"
 
 
+def _format_machine_metric(value: object) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "nan"
+    return format(number, ".17g") if math.isfinite(number) else "nan"
+
+
 def _print_official_row(dataset: str, row: dict, t_pred: int, t_true: float | None) -> None:
     ratio = t_pred / t_true if t_true else math.nan
     print(
@@ -521,6 +699,12 @@ def run_eval_on_train(args: argparse.Namespace) -> int:
             return 0
         summary = official_metric_module.summarise(official_rows)
         print(f"OFFICIAL summary: {summary}")
+        print(
+            f"OFFICIAL sweep_metrics: dataset_count={len(official_rows)} "
+            f"score={_format_machine_metric(summary.get('score'))} "
+            f"node_recall={_format_machine_metric(summary.get('node_recall'))} "
+            f"adj_edge_jaccard={_format_machine_metric(summary.get('adj_edge_jaccard'))}"
+        )
         return 0
 
     if not fallback_pairs:
@@ -537,16 +721,21 @@ def run_eval_on_train(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build a Phase 1.1 lightweight Biohub baseline submission.")
+    parser = argparse.ArgumentParser(description="Build a lightweight Biohub baseline submission.")
     parser.add_argument("--test-root", type=Path, help="Directory containing test/*.zarr stores.")
     parser.add_argument("--train-root", type=Path, help="Directory containing train/*.zarr and train/*.geff stores.")
     parser.add_argument("--sample-submission", type=Path, help="Official sample_submission.csv for validation.")
     parser.add_argument("--output", type=Path, default=Path("submission.csv"), help="Output submission CSV path.")
     parser.add_argument("--mode", choices=("smoke", "classical", "eval-on-train"), required=True)
+    parser.add_argument("--detection-policy", choices=("fixed", "adaptive-count"), default="fixed")
     parser.add_argument("--threshold-percentile", type=float, default=99.5)
     parser.add_argument("--min-distance-xy", type=int, default=5)
     parser.add_argument("--min-distance-z", type=int, default=2)
     parser.add_argument("--max-detections-per-frame", type=int, default=300)
+    parser.add_argument("--adaptive-mad-k", type=float, default=3.0)
+    parser.add_argument("--adaptive-min-detections", type=int, default=80)
+    parser.add_argument("--adaptive-max-detections", type=int, default=400)
+    parser.add_argument("--adaptive-count-smoothing-window", type=int, default=5)
     parser.add_argument("--sigma", type=float, default=1.0)
     parser.add_argument("--link-max-um", type=float, default=5.0)
     parser.add_argument("--limit", type=int)
@@ -560,6 +749,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     np.random.seed(args.seed)
     try:
+        if args.adaptive_mad_k < 0 or not math.isfinite(args.adaptive_mad_k):
+            raise ValueError("--adaptive-mad-k must be finite and non-negative")
+        if args.adaptive_min_detections < 0:
+            raise ValueError("--adaptive-min-detections must be non-negative")
+        if args.adaptive_max_detections < args.adaptive_min_detections:
+            raise ValueError("--adaptive-max-detections must be >= --adaptive-min-detections")
+        if args.adaptive_count_smoothing_window < 1:
+            raise ValueError("--adaptive-count-smoothing-window must be at least 1")
         if args.mode in {"smoke", "classical"} and args.test_root is None:
             parser.error(f"--test-root is required for --mode {args.mode}")
         if args.mode == "smoke":

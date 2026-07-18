@@ -1,89 +1,75 @@
-# Phase 1.1 Baseline Submission Report
+# Phase 1.1 Baseline and Phase 1.2A Adaptive Detection Report
 
-## Design
+## Immutable Reference Baseline
 
-Phase 1.1 adds a lightweight CPU-only baseline submission pipeline at:
+- Kaggle Version 7 is immutable.
+- Public leaderboard score: `0.180`
+- Local official 15-dataset score: `0.1800343922572182`
+- Reference parameters:
+  - `detection_policy=fixed`
+  - `threshold_percentile=99.7`
+  - `sigma=1.0`
+  - `max_detections_per_frame=300`
+  - `link_max_um=5.0`
 
-```bash
-python -m src.baseline.make_baseline_submission
-```
+The local official score agrees with the public leaderboard score at leaderboard precision. Version 7 remains the fixed comparison point for later phases and must not be replaced by adaptive experiments.
 
-The pipeline writes the exact official mixed node/edge CSV schema:
+## Phase 1.1 Design
 
-```text
-id, dataset, row_type, node_id, t, z, y, x, source_id, target_id
-```
+The Phase 1.1 pipeline is a deterministic, CPU-only classical baseline implemented in `src/baseline/make_baseline_submission.py`. It discovers datasets dynamically from `*.zarr` directories, reads one `(Z,Y,X)` timepoint at a time, and never loads a complete image volume into memory.
 
-It regenerates `id` as `0..N-1`, keeps `node_id` local to each dataset, emits official sentinel values for node and edge rows, and validates the output with the existing local validator when `--sample-submission` is provided.
+The fixed detector performs robust percentile normalization, optional Gaussian smoothing, intensity ranking, and spatial suppression. It retains at most `max_detections_per_frame` candidates. Adjacent frames are linked with deterministic one-to-one assignment in physical units, gated by `link_max_um`. This phase does not predict divisions.
 
-## Modes
-
-`--mode smoke` discovers `*.zarr` stores under `--test-root`, inspects image shape metadata or local fixture arrays safely, creates a tiny deterministic valid graph for each dataset, writes `submission.csv`, and validates it. This mode is for end-to-end plumbing only.
-
-`--mode classical` runs a simple per-frame detector and one-to-one linker. It detects peaks in voxel space, writes voxel coordinates, and links only adjacent frames using physical distances.
-
-`--mode eval-on-train` runs the same classical detector on train Zarr stores that have paired GEFF annotations, then evaluates with the existing official-style metric helper. If train data or optional official dependencies are unavailable, it skips cleanly.
-
-Eval-on-train now supports the real Kaggle GEFF node-property layout observed with `zarr 3.2.1`:
+Generated submissions use the official mixed node/edge schema:
 
 ```text
-edges/ids | shape=(50, 2) | dtype=uint64
-nodes/ids | shape=(52,) | dtype=uint64
-nodes/props/t/values | shape=(52,) | dtype=int64
-nodes/props/z/values | shape=(52,) | dtype=int64
-nodes/props/y/values | shape=(52,) | dtype=int64
-nodes/props/x/values | shape=(52,) | dtype=int64
+id,dataset,row_type,node_id,t,z,y,x,source_id,target_id
 ```
 
-The previous blocker was an assumption that `nodes/props` was directly readable as an array/table. The decoder now keeps that legacy path, but falls back to the official grouped property arrays above.
+Row IDs are regenerated as `0..N-1`, node IDs remain local to each dataset, edge endpoints must exist in the same dataset, and output is checked by the existing official-schema validator when `--sample-submission` is supplied.
 
-## Classical Strategy
+Eval-on-train uses the official `tracking_cellmot` scoring path when its optional dependencies are available. It loads ground-truth tracks without image data, converts predictions through the official bridge, and reports node recall, Edge Jaccard, adjusted Edge Jaccard, predicted and estimated true node counts, their ratio, and the summary score. The local fallback is used only when official packages are unavailable and is labeled `FALLBACK`.
 
-For each dataset, the baseline:
+## Phase 1.2A Adaptive Detection
 
-- detects OME-Zarr multiscale metadata when available and selects full-resolution level `0`
-- verifies the image array rank is `(T,Z,Y,X)`
-- processes one timepoint at a time
-- normalizes each frame using robust percentile clipping `[p1,p99]`
-- optionally smooths with `scipy.ndimage.gaussian_filter`
-- ranks local peak candidates by intensity
-- keeps at most `--max-detections-per-frame`
-- links detections from `t` to `t+1` only
-- uses one-to-one assignment through `scipy.optimize.linear_sum_assignment` when available
-- gates links by `--link-max-um`
-- predicts no divisions in Phase 1.1
+Phase 1.2A adds the opt-in `adaptive-count` policy while leaving the fixed detector unchanged. Each frame uses the existing normalization, smoothing, intensity ranking, and spatial suppression to produce candidate scores. The robust score threshold is:
 
-Local tests use small `.npy` fixture arrays inside `.zarr` directories so they do not require Kaggle data or the optional `zarr` package.
+```text
+robust_threshold = median(scores) + adaptive_mad_k * 1.4826 * MAD(scores)
+```
+
+The number of finite scores strictly above this threshold is clamped between `adaptive_min_detections` and `adaptive_max_detections`, subject to candidate availability. The strongest candidates are retained. A causal rolling median smooths frame-level targets using only the current and previous frames, preserving streaming execution.
+
+The policy handles empty candidate sets, zero MAD, low-contrast frames, non-finite scores, insufficient candidates, and incomplete initial smoothing windows. For every adaptive dataset it reports total `T_pred`, detections-per-frame mean/min/max, raw and smoothed target means, and frame counts that hit the lower and upper bounds.
+
+The implementation is deterministic for a fixed seed and uses only the existing lightweight NumPy, SciPy, Pandas, and Zarr stack.
 
 ## Defaults
 
+The CLI keeps `--detection-policy fixed` as the default so Phase 1.1 behavior remains the reference path. The compatibility default for `--threshold-percentile` remains `99.5`; all immutable-reference and Phase 1.2A Kaggle commands below pass `99.7` explicitly.
+
+Adaptive option defaults are:
+
 ```text
-threshold_percentile=99.5
-min_distance_xy=5
-min_distance_z=2
-max_detections_per_frame=300
-sigma=1.0
-link_max_um=5.0
-scale_zyx_um=(1.625, 0.40625, 0.40625)
+adaptive_mad_k=3.0
+adaptive_min_detections=80
+adaptive_max_detections=400
+adaptive_count_smoothing_window=5
 ```
 
-These defaults follow the Oracle findings: prioritize detection recall and valid one-to-one linking first. Coordinate precision beyond roughly `1-2 um` is less urgent than missing nodes or wrong links, and division prediction is deferred because division removal had a smaller targeted cost than node dropout or edge swaps.
+The shared defaults used by the documented adaptive runs are `sigma=1.0`, `min_distance_xy=5`, `min_distance_z=2`, `link_max_um=5.0`, and `seed=42`.
 
 ## Known Limitations
 
-This is not a competitive model yet. It has no learned detector, no segmentation, no motion model beyond adjacent-frame assignment, no division prediction, and only basic intensity-peak detection. Dense or noisy frames may require parameter tuning, especially `threshold_percentile`, `sigma`, and `max_detections_per_frame`.
+This remains a classical intensity-peak baseline. It has no learned detector, segmentation model, division predictor, or motion model beyond adjacent-frame assignment. Adaptive-count changes how many spatially suppressed candidates are retained; it does not improve localization quality or association semantics. Dense, noisy, and very low-contrast frames can still require parameter tuning.
 
-## Local Usage
+Local verification uses synthetic Zarr fixtures because the official Kaggle image and GEFF stores are not present in this workspace. Real-data scores and runtime must therefore be measured in Kaggle.
 
-```bash
-python -m src.baseline.make_baseline_submission \
-  --test-root path/to/test \
-  --sample-submission path/to/sample_submission.csv \
-  --output submission.csv \
-  --mode smoke
-```
+## Kaggle Commands
 
-## Kaggle Usage
+### Fixed Baseline Submission
+
+This reproduces the immutable Version 7 fixed-policy configuration:
 
 ```bash
 python -m src.baseline.make_baseline_submission \
@@ -91,50 +77,95 @@ python -m src.baseline.make_baseline_submission \
   --sample-submission /kaggle/input/competitions/biohub-cell-tracking-during-development/sample_submission.csv \
   --output /kaggle/working/submission.csv \
   --mode classical \
-  --threshold-percentile 99.5 \
+  --detection-policy fixed \
+  --threshold-percentile 99.7 \
   --max-detections-per-frame 300 \
   --sigma 1.0 \
   --link-max-um 5.0
 ```
 
-## Eval-On-Train Status
+### Adaptive Eval-on-Train
 
-The CLI supports `--mode eval-on-train`, but this local workspace does not contain Kaggle train Zarr/GEFF data. If `tracking_cellmot` is available, eval-on-train now prefers the official scoring path:
-
-- load GT with `tracking_cellmot.io.open_dataset(..., normalize=False, require_tracks=True, load_image=False)`
-- convert predicted submission rows through `submission_df_to_tracksdata`
-- score with `tracking_cellmot.metrics.evaluate`, `node_recall`, `per_sample_metrics`, and `summarise`
-
-If official packages are unavailable, eval-on-train uses local `SequenceGraph` fallback counts and labels output as `FALLBACK`.
-
-Run it inside Kaggle with:
+This evaluates one adaptive configuration on 15 dynamically discovered training datasets:
 
 ```bash
 python -m src.baseline.make_baseline_submission \
   --train-root /kaggle/input/competitions/biohub-cell-tracking-during-development/train \
   --mode eval-on-train \
-  --limit 5
+  --limit 15 \
+  --detection-policy adaptive-count \
+  --threshold-percentile 99.7 \
+  --sigma 1.0 \
+  --adaptive-mad-k 3.0 \
+  --adaptive-min-detections 80 \
+  --adaptive-max-detections 400 \
+  --adaptive-count-smoothing-window 5 \
+  --link-max-um 5.0
 ```
 
-First Kaggle fallback result before the official scoring preference was added:
+### Fast Adaptive Sweep
 
-```text
-44b6_0113de3b: edge_jaccard=0.45902 adj_edge_jaccard=0.46781 node_recall=NA T_pred=20819 T_true=25755.0 T_pred/T_true=0.80835 score=0.46781
-44b6_0b24845f: edge_jaccard=0.04000 adj_edge_jaccard=0.04228 node_recall=NA T_pred=14087 T_true=32795.0 T_pred/T_true=0.42955 score=0.04228
-44b6_0c582fdc: edge_jaccard=0.04110 adj_edge_jaccard=0.04285 node_recall=NA T_pred=16017 T_true=27958.0 T_pred/T_true=0.57290 score=0.04285
-summary: adj_edge_jaccard=0.18358 division_jaccard=nan score=0.18358
+This runs the recommended 12-configuration grid on three dynamically discovered training datasets and writes results after every configuration:
+
+```bash
+python -m src.baseline.sweep_adaptive \
+  --train-root /kaggle/input/competitions/biohub-cell-tracking-during-development/train \
+  --limit 3 \
+  --threshold-percentile 99.7 \
+  --sigma 1.0 \
+  --min-distance-xy 5 \
+  --min-distance-z 2 \
+  --adaptive-min-detections 80 \
+  --adaptive-count-smoothing-window 5 \
+  --adaptive-mad-k-values 2.5,3.0,3.5 \
+  --adaptive-max-detections-values 300,400 \
+  --link-max-um-values 5.0,7.0 \
+  --seed 42 \
+  --output /kaggle/working/adaptive_sweep_fast.csv
 ```
 
-Those fallback numbers were useful for calibration but not fully official. The low `T_pred/T_true` values, especially `0.42955` and `0.57290`, suggest the current classical detector is under-detecting on some datasets; recall-oriented tuning remains the next practical lever.
+### Final Selected-Configuration Evaluation
 
-## Test Status
+The two `--config` tuples below are placeholders in the accepted `MAD_K,MAX_DETECTIONS,LINK_MAX_UM` format. Replace them with the two fast-sweep winners before running the 15-dataset evaluation.
 
-Baseline tests currently pass locally on synthetic fixtures. Full-suite output is recorded in the final task response.
+```bash
+python -m src.baseline.sweep_adaptive \
+  --train-root /kaggle/input/competitions/biohub-cell-tracking-during-development/train \
+  --limit 15 \
+  --threshold-percentile 99.7 \
+  --sigma 1.0 \
+  --min-distance-xy 5 \
+  --min-distance-z 2 \
+  --adaptive-min-detections 80 \
+  --adaptive-count-smoothing-window 5 \
+  --seed 42 \
+  --config 2.5,400,5.0 \
+  --config 3.0,400,7.0 \
+  --output /kaggle/working/adaptive_sweep_final.csv
+```
 
-Verified Kaggle Phase 1.1 status before this fix:
+### Adaptive Hidden-Test Submission
 
-- smoke mode succeeded on real test data
-- classical mode `--limit 1` succeeded on real test Zarr
-- `44b6_0113de3b` resolved `array=0`, `shape=(100,64,256,256)`
-- submission validation passed
-- with `--max-detections-per-frame 150`, the limit-1 output contained `15000` nodes and `9085` edges
+This creates a validated hidden-test submission for one selected adaptive configuration:
+
+```bash
+python -m src.baseline.make_baseline_submission \
+  --test-root /kaggle/input/competitions/biohub-cell-tracking-during-development/test \
+  --sample-submission /kaggle/input/competitions/biohub-cell-tracking-during-development/sample_submission.csv \
+  --output /kaggle/working/submission.csv \
+  --mode classical \
+  --detection-policy adaptive-count \
+  --threshold-percentile 99.7 \
+  --sigma 1.0 \
+  --adaptive-mad-k 3.0 \
+  --adaptive-min-detections 80 \
+  --adaptive-max-detections 400 \
+  --adaptive-count-smoothing-window 5 \
+  --link-max-um 5.0
+```
+
+## Verification
+
+Pre-commit verification covers the complete pytest suite, both CLI help surfaces, Markdown structure, command integrity, and `git diff --check`. Kaggle-only integration tests skip cleanly when official data or optional runtime packages are unavailable.
+
+No packaging ZIP is created by this phase, and no changes should be committed until review is approved.
