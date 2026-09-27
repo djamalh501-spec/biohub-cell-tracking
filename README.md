@@ -1,5 +1,8 @@
 # Biohub Cell Tracking
-
+![Python](https://img.shields.io/badge/Python-3.x-blue)
+![PyTorch](https://img.shields.io/badge/PyTorch-Computer%20Vision-orange)
+![Kaggle](https://img.shields.io/badge/Kaggle-Biohub-20BEFF)
+![Status](https://img.shields.io/badge/status-research%20project-success)
 Cell tracking and division-aware lineage reconstruction pipeline developed for the Biohub microscopy tracking challenge.
 
 ## Overview
